@@ -53,7 +53,22 @@ move_basis = st.sidebar.radio(
 # ── Data ─────────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600)
 def load_data(start: date, end: date) -> pd.DataFrame:
-    raw = yf.download("^GSPC", start=start, end=end, interval="1d", auto_adjust=True)
+    # Fetch in 6-month chunks to avoid Yahoo Finance large-request limits
+    chunks = []
+    chunk_start = start
+    while chunk_start < end:
+        chunk_end = min(chunk_start + timedelta(days=180), end)
+        raw = yf.download("^GSPC", start=chunk_start, end=chunk_end,
+                          interval="1d", auto_adjust=True, progress=False)
+        if not raw.empty:
+            chunks.append(raw)
+        chunk_start = chunk_end + timedelta(days=1)
+
+    if not chunks:
+        return pd.DataFrame()
+
+    raw = pd.concat(chunks)
+    raw = raw[~raw.index.duplicated()]
     raw.columns = raw.columns.get_level_values(0)
     df = raw[["Open", "High", "Low", "Close"]].copy()
     df["Prev Close"] = df["Close"].shift(1)
