@@ -63,7 +63,15 @@ def load_data(start: date, end: date) -> pd.DataFrame:
     return df
 
 with st.spinner("Fetching SPX data…"):
-    df = load_data(start_date, end_date)
+    try:
+        df = load_data(start_date, end_date)
+        if df.empty:
+            st.error("yfinance returned empty data. Yahoo Finance may be blocking the request.")
+            st.stop()
+    except Exception as e:
+        st.error(f"Failed to fetch data: {e}")
+        st.exception(e)
+        st.stop()
 
 # Pick the move column based on user selection
 move_col = "C2C Change" if "Close → Close" in move_basis else "O2C Change"
