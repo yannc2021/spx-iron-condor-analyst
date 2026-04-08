@@ -4,15 +4,21 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import date, timedelta
+import math
+from math import erfc, sqrt
 
 st.set_page_config(page_title="SPX Iron Condor Analyst", layout="wide")
 st.title("SPX Iron Condor EV Analyst")
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────
-st.sidebar.header("Date Range")
+if st.sidebar.button("Refresh Data", use_container_width=True):
+    st.cache_data.clear()
+
+st.sidebar.header("Strategy Settings")
 
 today = date.today()
 
+# ── Date Range (main page) ────────────────────────────────────────────────────
 presets = {
     "Last Week": (today - timedelta(weeks=1), today),
     "Last Month": (today - timedelta(days=30), today),
@@ -24,17 +30,16 @@ presets = {
     "Custom": None,
 }
 
-preset = st.sidebar.radio("Quick select", list(presets.keys()), index=4)
+dr_cols = st.columns([6, 1])
+with dr_cols[0]:
+    preset = st.radio("Date range", list(presets.keys()), index=4, horizontal=True, label_visibility="collapsed")
+with dr_cols[1]:
+    if preset == "Custom":
+        start_date = st.date_input("Start date", value=today - timedelta(days=365))
+        end_date = st.date_input("End date", value=today)
 
-if preset == "Custom":
-    start_date = st.sidebar.date_input("Start date", value=today - timedelta(days=365))
-    end_date = st.sidebar.date_input("End date", value=today)
-else:
+if preset != "Custom":
     start_date, end_date = presets[preset]
-    st.sidebar.caption(f"{start_date.strftime('%b %d, %Y')}  →  {end_date.strftime('%b %d, %Y')}")
-
-st.sidebar.divider()
-st.sidebar.header("Strategy Settings")
 
 credit_fill = st.sidebar.number_input(
     "Credit (fill price $)",
@@ -55,7 +60,7 @@ move_basis = st.sidebar.radio(
 )
 
 # ── Data ─────────────────────────────────────────────────────────────────────
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=900)
 def load_data(start: date, end: date) -> pd.DataFrame:
     chunks = []
     chunk_start = start
@@ -82,6 +87,12 @@ def load_data(start: date, end: date) -> pd.DataFrame:
     df = df.dropna().round(4)
     return df
 
+@st.cache_data(ttl=900)
+def load_vix() -> float:
+    raw = yf.download("^VIX", period="5d", interval="1d", progress=False)
+    raw.columns = raw.columns.get_level_values(0)
+    return float(raw["Close"].iloc[-1])
+
 with st.spinner("Fetching SPX data…"):
     try:
         df = load_data(start_date, end_date)
@@ -92,6 +103,12 @@ with st.spinner("Fetching SPX data…"):
         st.error(f"Failed to fetch data: {e}")
         st.exception(e)
         st.stop()
+
+with st.spinner("Fetching VIX…"):
+    try:
+        current_vix = load_vix()
+    except Exception:
+        current_vix = None
 
 move_col = "C2C %" if "Close → Close" in move_basis else "O2C %"
 move_label = "Close-to-Close" if "Close → Close" in move_basis else "Open-to-Close"
@@ -104,13 +121,22 @@ max_loss = wing - credit
 total = len(df)
 abs_pct = df[move_col].abs()
 
-# ── Delta-calibrated thresholds ───────────────────────────────────────────────
+# ── Historical delta-calibrated thresholds (for EV analysis) ──────────────────
 # 0.20 delta → 80th pct of |% moves| (20% of days exceed it)
 # 0.15 delta → 85th pct, 0.10 delta → 90th pct
-delta_levels = {
+hist_delta_levels = {
     "~0.20 delta": (abs_pct.quantile(0.80), "#ff9800"),
     "~0.15 delta": (abs_pct.quantile(0.85), "#29b6f6"),
     "~0.10 delta": (abs_pct.quantile(0.90), "#ab47bc"),
+}
+
+# ── VIX-based strike thresholds ───────────────────────────────────────────────
+# Daily 1σ move = SPX × (VIX/100) / √252
+# σ multiples from standard normal: 0.20δ → 0.842σ, 0.15δ → 1.036σ, 0.10δ → 1.282σ
+VIX_SIGMA = {
+    "~0.20 delta": (0.842, "#ff9800"),
+    "~0.15 delta": (1.036, "#29b6f6"),
+    "~0.10 delta": (1.282, "#ab47bc"),
 }
 
 # ── Sidebar: show point equivalents at current SPX ────────────────────────────
@@ -120,16 +146,26 @@ st.sidebar.caption(f"Credit = ${credit_fill:.2f} fill  (${credit_dollars:.0f}/co
 st.sidebar.caption(f"Wing   = {wing} pts  (${wing*100:.0f}/lot)")
 st.sidebar.caption(f"Max loss ≈ {max_loss:.1f} pts  (${max_loss*100:.0f}/lot)")
 
-# ── Strike thresholds ────────────────────────────────────────────────────────
+# ── Strike thresholds (VIX-based) ────────────────────────────────────────────
 last_date = df.index[-1].strftime("%B %d, %Y")
-st.subheader(f"Strike Thresholds  —  SPX closed at {current_spx:,.2f} on {last_date}")
-cols = st.columns(3)
-for col, (label, (threshold, color)) in zip(cols, delta_levels.items()):
-    upper = current_spx * (1 + threshold / 100)
-    lower = current_spx * (1 - threshold / 100)
-    col.markdown(f"#### {label}  <span style='color:{color}'>●</span>", unsafe_allow_html=True)
-    col.metric("Upper", f"{upper:,.2f}  (+{threshold:.2f}%)")
-    col.metric("Lower", f"{lower:,.2f}  (−{threshold:.2f}%)")
+
+if current_vix is not None:
+    daily_1sigma_pts = current_spx * (current_vix / 100) / math.sqrt(252)
+    daily_1sigma_pct = (current_vix / 100) / math.sqrt(252) * 100
+
+    st.subheader(f"Strike Thresholds  —  SPX {current_spx:,.2f}  |  VIX {current_vix:.2f}  |  1σ ≈ {daily_1sigma_pts:,.0f} pts ({daily_1sigma_pct:.2f}%)")
+    cols = st.columns(3)
+    for col, (label, (sigma_mult, color)) in zip(cols, VIX_SIGMA.items()):
+        move_pts = daily_1sigma_pts * sigma_mult
+        move_pct = daily_1sigma_pct * sigma_mult
+        upper = current_spx + move_pts
+        lower = current_spx - move_pts
+        col.markdown(f"#### {label}  <span style='color:{color}'>●</span>", unsafe_allow_html=True)
+        col.metric("Upper strike", f"{upper:,.2f}  (+{move_pct:.2f}%)")
+        col.metric("Lower strike", f"{lower:,.2f}  (−{move_pct:.2f}%)")
+        col.caption(f"±{move_pts:,.0f} pts from current close")
+else:
+    st.warning("VIX unavailable — strike thresholds cannot be calculated.")
 
 st.divider()
 
@@ -137,7 +173,7 @@ st.divider()
 st.subheader(f"EV by Delta Level  —  {move_label}  |  {total} trading days")
 
 cols = st.columns(3)
-for col, (label, (threshold, color)) in zip(cols, delta_levels.items()):
+for col, (label, (threshold, color)) in zip(cols, hist_delta_levels.items()):
     outside = (abs_pct > threshold).sum()
     inside = total - outside
     p_inside = inside / total
@@ -160,8 +196,7 @@ with st.expander("EV Breakdown", expanded=False):
     b2.metric("Wing width", f"{wing} pts  (${wing*100:.0f}/lot)")
     b3.metric("Max loss", f"{max_loss:.2f} pts  ≈ ${max_loss*100:.0f}/lot")
 
-    # Show formula for each level
-    for label, (threshold, _) in delta_levels.items():
+    for label, (threshold, _) in hist_delta_levels.items():
         outside = (abs_pct > threshold).sum()
         inside = total - outside
         p_inside = inside / total
@@ -171,11 +206,80 @@ with st.expander("EV Breakdown", expanded=False):
             rf"\text{{EV ({label})}} = {p_inside:.3f} \times {credit:.2f} - {p_outside:.3f} \times {max_loss:.2f} = {ev_pts:+.4f} \text{{ pts}}"
         )
 
+# ── Optimization Table ───────────────────────────────────────────────────────
+st.subheader("Strike Optimization Table")
+
+if current_vix is not None:
+    daily_1sigma_pct_ev = (current_vix / 100) / sqrt(252) * 100
+
+    sigma_levels = [0.50, 0.75, 1.00, 1.25, 1.50, 1.75, 2.00, 2.25, 2.50]
+
+    rows = []
+    for sigma in sigma_levels:
+        move_pct = sigma * daily_1sigma_pct_ev
+        move_pts = move_pct / 100 * current_spx
+        delta = 0.5 * erfc(sigma / sqrt(2))
+
+        win_days = (abs_pct < move_pct).sum()
+        lose_days = total - win_days
+        win_rate = win_days / total
+        lose_rate = lose_days / total
+
+        ev_dollar = (win_rate * credit - lose_rate * max_loss) * 100
+        breakeven_credit = (lose_rate * max_loss) / win_rate if win_rate > 0 else float("nan")
+
+        rows.append({
+            "Delta": delta,
+            "% Move": move_pct,
+            "±Pts": move_pts,
+            "Upper Strike": current_spx + move_pts,
+            "Lower Strike": current_spx - move_pts,
+            "Win Rate": win_rate,
+            "B/E Credit": breakeven_credit,
+            "EV": ev_dollar,
+        })
+
+    opt_df = pd.DataFrame(rows)
+
+    best_ev_idx = opt_df["EV"].idxmax()
+
+    ev_numeric = opt_df["EV"]
+
+    def style_opt_table(df):
+        styles = pd.DataFrame("", index=df.index, columns=df.columns)
+        styles.loc[best_ev_idx] = "background-color: rgba(38, 166, 154, 0.25); font-weight: bold"
+        for i in df.index:
+            color = "color: #26a69a" if ev_numeric[i] >= 0 else "color: #ef5350"
+            cur = styles.loc[i, "EV"]
+            styles.loc[i, "EV"] = f"{cur}; {color}" if cur else color
+        return styles
+
+    display_df = opt_df.copy()
+    display_df["Delta"] = display_df["Delta"].map(lambda x: f"{x:.3f}")
+    display_df["% Move"] = display_df["% Move"].map(lambda x: f"±{x:.2f}%")
+    display_df["±Pts"] = display_df["±Pts"].map(lambda x: f"±{x:,.0f}")
+    display_df["Upper Strike"] = display_df["Upper Strike"].map(lambda x: f"{x:,.2f}")
+    display_df["Lower Strike"] = display_df["Lower Strike"].map(lambda x: f"{x:,.2f}")
+    display_df["Win Rate"] = display_df["Win Rate"].map(lambda x: f"{x*100:.1f}%")
+    display_df["B/E Credit"] = display_df["B/E Credit"].map(lambda x: f"${x:.2f}")
+    display_df["EV"] = display_df["EV"].map(lambda x: f"${x:+.0f}")
+
+    st.caption(f"Based on VIX {current_vix:.2f}  |  Credit fill ${credit_fill:.2f}  |  Wing {wing} pts  |  {total} historical days  —  highlighted row = best EV")
+    st.dataframe(
+        display_df.style.apply(style_opt_table, axis=None),
+        use_container_width=True,
+        hide_index=True,
+    )
+else:
+    st.warning("VIX unavailable — optimization table requires VIX.")
+
+st.divider()
+
 # ── Chart ─────────────────────────────────────────────────────────────────────
 st.subheader(f"SPX {move_label} Moves (%) with Delta-Level Thresholds")
 
 # Use the widest threshold (0.20 delta) to colour inside/outside
-primary_threshold = list(delta_levels.values())[0][0]
+primary_threshold = list(hist_delta_levels.values())[0][0]
 inside_mask = abs_pct <= primary_threshold
 colors = inside_mask.map({True: "#26a69a", False: "#ef5350"})
 
@@ -212,7 +316,7 @@ fig.add_trace(
 )
 
 # Threshold lines for all three delta levels
-for label, (threshold, color) in delta_levels.items():
+for label, (threshold, color) in hist_delta_levels.items():
     for sign in [1, -1]:
         fig.add_hline(
             y=sign * threshold,
@@ -240,7 +344,7 @@ st.plotly_chart(fig, use_container_width=True)
 
 # ── Daily table ───────────────────────────────────────────────────────────────
 st.subheader("Daily Data")
-threshold_options = {label: val for label, (val, _) in delta_levels.items()}
+threshold_options = {label: val for label, (val, _) in hist_delta_levels.items()}
 selected_threshold_label = st.radio(
     "Highlight outside", list(threshold_options.keys()), horizontal=True
 )
