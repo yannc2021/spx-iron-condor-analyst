@@ -153,7 +153,7 @@ if current_vix is not None:
     daily_1sigma_pts = current_spx * (current_vix / 100) / math.sqrt(252)
     daily_1sigma_pct = (current_vix / 100) / math.sqrt(252) * 100
 
-    st.subheader(f"Strike Thresholds  —  SPX {current_spx:,.2f}  |  VIX {current_vix:.2f}  |  1σ ≈ {daily_1sigma_pts:,.0f} pts ({daily_1sigma_pct:.2f}%)")
+    st.subheader(f"Strike Thresholds  —  {last_date}  |  SPX {current_spx:,.2f}  |  VIX {current_vix:.2f}  |  1σ ≈ {daily_1sigma_pts:,.0f} pts ({daily_1sigma_pct:.2f}%)")
     cols = st.columns(3)
     for col, (label, (sigma_mult, color)) in zip(cols, VIX_SIGMA.items()):
         move_pts = daily_1sigma_pts * sigma_mult
@@ -164,6 +164,31 @@ if current_vix is not None:
         col.metric("Upper strike", f"{upper:,.2f}  (+{move_pct:.2f}%)")
         col.metric("Lower strike", f"{lower:,.2f}  (−{move_pct:.2f}%)")
         col.caption(f"±{move_pts:,.0f} pts from current close")
+
+    with st.expander("How are these strikes calculated?"):
+        st.markdown(f"""
+**Step 1 — Daily 1σ move from VIX**
+
+VIX is the market's annualized implied volatility for SPX (expressed as a percentage).
+To convert it to a single-day 1-standard-deviation move:
+
+$$\\text{{Daily 1}}\\sigma = SPX \\times \\frac{{VIX}}{{100}} \\div \\sqrt{{252}}$$
+
+At current values: **{current_spx:,.0f} × {current_vix/100:.4f} ÷ √252 ≈ ±{daily_1sigma_pts:,.0f} pts ({daily_1sigma_pct:.2f}%)**
+
+**Step 2 — σ multiples for each delta level**
+
+Under a log-normal (Black-Scholes) model, short-strike delta maps to a σ multiple via the
+standard-normal inverse CDF:
+
+| Delta | σ multiple | Meaning |
+|-------|-----------|---------|
+| ~0.20δ | 0.842σ | 20% of days expected to close beyond this level |
+| ~0.15δ | 1.036σ | 15% of days expected to close beyond this level |
+| ~0.10δ | 1.282σ | 10% of days expected to close beyond this level |
+
+Each strike = SPX ± (σ multiple × daily 1σ pts).
+""")
 else:
     st.warning("VIX unavailable — strike thresholds cannot be calculated.")
 
